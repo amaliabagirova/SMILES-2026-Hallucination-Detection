@@ -1,4 +1,4 @@
-"""smaller early-stopping MLP probe."""
+"""early-stopping MLP probe."""
 
 from __future__ import annotations
 
@@ -10,14 +10,17 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
 
 
-class _SmallMLP(nn.Module):
+class _MLP(nn.Module):
     def __init__(self, input_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Dropout(0.30),
-            nn.Linear(128, 1),
+            nn.Dropout(0.25),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Dropout(0.15),
+            nn.Linear(64, 1),
         )
 
     def forward(self, x):
@@ -44,7 +47,7 @@ class HallucinationProbe:
         y_t = torch.tensor(y_train, dtype=torch.float32, device=self.device)
 
         input_dim = X_train_scaled.shape[1]
-        self.model = _SmallMLP(input_dim).to(self.device)
+        self.model = _MLP(input_dim).to(self.device)
 
         n_pos = float((y_train == 1).sum())
         n_neg = float((y_train == 0).sum())
@@ -54,13 +57,15 @@ class HallucinationProbe:
         optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=7e-4,
-            weight_decay=3e-3,
+            weight_decay=2e-3,
         )
 
+        # Prepare validation tensors for early stopping
         has_val = X_val is not None and y_val is not None
         if has_val:
             X_val = np.asarray(X_val, dtype=np.float32)
             y_val_float = np.asarray(y_val).astype(np.float32)
+
             X_val_scaled = self.scaler.transform(X_val).astype(np.float32)
 
             X_v = torch.tensor(X_val_scaled, dtype=torch.float32, device=self.device)
@@ -68,9 +73,9 @@ class HallucinationProbe:
 
         best_state = None
         best_val_loss = float("inf")
-        patience = 35
+        patience = 30
         bad_epochs = 0
-        max_epochs = 350
+        max_epochs = 300
 
         for _ in range(max_epochs):
             self.model.train()
@@ -99,6 +104,7 @@ class HallucinationProbe:
         if has_val and best_state is not None:
             self.model.load_state_dict(best_state)
 
+        # Threshold calibration on validation accuracy.
         if X_val is not None and y_val is not None:
             y_val_int = np.asarray(y_val).astype(int)
             probs = self.predict_proba(X_val)[:, 1]
