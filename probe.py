@@ -1,4 +1,4 @@
-"""seed ensemble of accuracy-calibrated MLP probes"""
+"""probe.py  MLP probe with validation accuracy threshold calibration"""
 
 from __future__ import annotations
 
@@ -7,9 +7,6 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
-
-
-SEEDS = [13, 42, 777]
 
 
 class _MLP(nn.Module):
@@ -32,11 +29,14 @@ class _MLP(nn.Module):
 class HallucinationProbe:
     def __init__(self):
         self.scaler = StandardScaler()
-        self.models = []
+        self.model = None
         self.threshold = 0.5
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def fit(self, X_train, y_train, X_val=None, y_val=None):
+        torch.manual_seed(42)
+        np.random.seed(42)
+
         X_train = np.asarray(X_train, dtype=np.float32)
         y_train = np.asarray(y_train).astype(np.float32)
 
@@ -46,35 +46,29 @@ class HallucinationProbe:
         y_t = torch.tensor(y_train, dtype=torch.float32, device=self.device)
 
         input_dim = X_train_scaled.shape[1]
+        self.model = _MLP(input_dim).to(self.device)
 
+        # Class imbalance correction: more hallucinated than truthful.
         n_pos = float((y_train == 1).sum())
         n_neg = float((y_train == 0).sum())
         pos_weight = torch.tensor([n_neg / max(n_pos, 1.0)], dtype=torch.float32, device=self.device)
 
-        self.models = []
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=1e-3,
+            weight_decay=1e-3,
+        )
 
-        for seed in SEEDS:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
+        self.model.train()
+        for _ in range(250):
+            optimizer.zero_grad()
+            logits = self.model(X_t)
+            loss = criterion(logits, y_t)
+            loss.backward()
+            optimizer.step()
 
-            model = _MLP(input_dim).to(self.device)
-            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=1e-3,
-                weight_decay=1e-3,
-            )
-
-            model.train()
-            for _ in range(250):
-                optimizer.zero_grad()
-                logits = model(X_t)
-                loss = criterion(logits, y_t)
-                loss.backward()
-                optimizer.step()
-
-            self.models.append(model)
-
+        # threshold calibration on validation accuracy
         if X_val is not None and y_val is not None:
             X_val = np.asarray(X_val, dtype=np.float32)
             y_val = np.asarray(y_val).astype(int)
@@ -100,18 +94,15 @@ class HallucinationProbe:
     def predict_proba(self, X):
         X = np.asarray(X, dtype=np.float32)
         X_scaled = self.scaler.transform(X).astype(np.float32)
+
         X_t = torch.tensor(X_scaled, dtype=torch.float32, device=self.device)
 
-        probs_all = []
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(X_t)
+            probs_pos = torch.sigmoid(logits).detach().cpu().numpy()
 
-        for model in self.models:
-            model.eval()
-            with torch.no_grad():
-                logits = model(X_t)
-                probs = torch.sigmoid(logits).detach().cpu().numpy()
-                probs_all.append(probs)
-
-        probs_pos = np.mean(np.stack(probs_all, axis=0), axis=0).astype(np.float32)
+        probs_pos = probs_pos.astype(np.float32)
         probs_neg = 1.0 - probs_pos
 
         return np.stack([probs_neg, probs_pos], axis=1)
