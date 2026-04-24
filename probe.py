@@ -44,8 +44,8 @@ class HallucinationProbe:
 
         self.clip_low = None
         self.clip_high = None
-        self.lower_q = 1.0
-        self.upper_q = 99.0
+        self.lower_q = 2.0
+        self.upper_q = 98.0
 
     def _clip(self, X):
         if self.clip_low is None or self.clip_high is None:
