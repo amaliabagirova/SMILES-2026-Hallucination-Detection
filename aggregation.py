@@ -1,4 +1,4 @@
-"""aggregation.py — final candidate: sparse two-cell aggregation.
+"""final candidate sparse two-cell aggregation.
 
 Uses:
 - transformer layer 6, token -1
