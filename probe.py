@@ -1,4 +1,12 @@
-"""early-stopping MLP probe."""
+"""percentile feature clipping + early-stopping MLP
+
+Uses the current best aggregation:
+- L2-normalized sparse 2A hidden-state features
+
+Adds:
+- train-percentile clipping before scaling
+- early stopping MLP probe
+"""
 
 from __future__ import annotations
 
@@ -34,6 +42,16 @@ class HallucinationProbe:
         self.threshold = 0.5
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        self.clip_low = None
+        self.clip_high = None
+        self.lower_q = 1.0
+        self.upper_q = 99.0
+
+    def _clip(self, X):
+        if self.clip_low is None or self.clip_high is None:
+            return X
+        return np.clip(X, self.clip_low, self.clip_high)
+
     def fit(self, X_train, y_train, X_val=None, y_val=None):
         torch.manual_seed(42)
         np.random.seed(42)
@@ -41,6 +59,11 @@ class HallucinationProbe:
         X_train = np.asarray(X_train, dtype=np.float32)
         y_train = np.asarray(y_train).astype(np.float32)
 
+        # Percentile clipping is fitted only on train fold.
+        self.clip_low = np.percentile(X_train, self.lower_q, axis=0).astype(np.float32)
+        self.clip_high = np.percentile(X_train, self.upper_q, axis=0).astype(np.float32)
+
+        X_train = self._clip(X_train)
         X_train_scaled = self.scaler.fit_transform(X_train).astype(np.float32)
 
         X_t = torch.tensor(X_train_scaled, dtype=torch.float32, device=self.device)
@@ -51,7 +74,11 @@ class HallucinationProbe:
 
         n_pos = float((y_train == 1).sum())
         n_neg = float((y_train == 0).sum())
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1.0)], dtype=torch.float32, device=self.device)
+        pos_weight = torch.tensor(
+            [n_neg / max(n_pos, 1.0)],
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         optimizer = torch.optim.AdamW(
@@ -60,12 +87,12 @@ class HallucinationProbe:
             weight_decay=2e-3,
         )
 
-        # Prepare validation tensors for early stopping
         has_val = X_val is not None and y_val is not None
         if has_val:
             X_val = np.asarray(X_val, dtype=np.float32)
             y_val_float = np.asarray(y_val).astype(np.float32)
 
+            X_val = self._clip(X_val)
             X_val_scaled = self.scaler.transform(X_val).astype(np.float32)
 
             X_v = torch.tensor(X_val_scaled, dtype=torch.float32, device=self.device)
@@ -80,6 +107,7 @@ class HallucinationProbe:
         for _ in range(max_epochs):
             self.model.train()
             optimizer.zero_grad()
+
             logits = self.model(X_t)
             loss = criterion(logits, y_t)
             loss.backward()
@@ -104,7 +132,7 @@ class HallucinationProbe:
         if has_val and best_state is not None:
             self.model.load_state_dict(best_state)
 
-        # Threshold calibration on validation accuracy.
+        # Accuracy-oriented threshold calibration.
         if X_val is not None and y_val is not None:
             y_val_int = np.asarray(y_val).astype(int)
             probs = self.predict_proba(X_val)[:, 1]
@@ -127,7 +155,9 @@ class HallucinationProbe:
 
     def predict_proba(self, X):
         X = np.asarray(X, dtype=np.float32)
+        X = self._clip(X)
         X_scaled = self.scaler.transform(X).astype(np.float32)
+
         X_t = torch.tensor(X_scaled, dtype=torch.float32, device=self.device)
 
         self.model.eval()
